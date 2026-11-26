@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { signedQuery } from '../src/client.js';
+import { signedQuery, send } from '../src/client.js';
 import { approval, event, push, waitingRoom, dataString, defaultDetails } from '../src/commands.js';
 import { run } from '../src/main.js';
 import { setWriter } from '../src/core.js';
@@ -113,9 +113,9 @@ test('approval waits through a question and outputs the decision', async () => {
     assert.match(req.url, /^\/apps\/7\/approvals\/apr_1\?/);
     assert.equal(new URL(req.url, 'http://x').searchParams.get('wait'), '25');
     if (n === 2) {
-      return [200, { approval_id: 'apr_1', status: 'pending', awaiting_reply: true, url: 'u', discussion: [{ id: 'm1', from: 'approver', name: 'Bo', text: 'Which region?' }] }];
+      return [200, { approval_id: 'apr_1', status: 'pending', awaiting_reply: true, discussion: [{ id: 'm1', from: 'approver', name: 'Bo', text: 'Which region?' }] }];
     }
-    return [200, { approval_id: 'apr_1', status: 'approved', url: 'https://hibira.io/a/apr_1', choice: 'Ship it', comment: 'go', answered_by: { email: 'bo@acme.test', name: 'Bo' } }];
+    return [200, { approval_id: 'apr_1', status: 'approved', choice: 'Ship it', comment: 'go', answered_by: { email: 'bo@acme.test', name: 'Bo' } }];
   });
   const env = envFor(srv.host, { TITLE: 'Deploy v1.2 to production?', OPTIONS: 'Ship it\nHold', 'PUSH-INTERESTS': 'oncall', 'TIMEOUT-MINUTES': '30' });
   const slept = [];
@@ -123,12 +123,13 @@ test('approval waits through a question and outputs the decision', async () => {
   await srv.close();
   assert.equal(srv.calls.length, 3);
   assert.deepEqual(slept, [5000]);
-  assert.match(logged, /Bo asked: Which region\?/);
+  assert.match(logged, /Bo asked: "Which region\?"/);
   const out = outputs(env);
   assert.equal(out.status, 'approved');
   assert.equal(out.choice, 'Ship it');
   assert.equal(out['answered-by'], 'bo@acme.test');
   assert.equal(out['approval-id'], 'apr_1');
+  assert.equal(out.url, 'https://hibira.io/a/apr_1', 'the link survives a status answer without it');
   assert.match(readFileSync(env.GITHUB_STEP_SUMMARY, 'utf8'), /Answer it here\]\(https:\/\/hibira.io\/a\/apr_1\)/);
 });
 
@@ -151,6 +152,21 @@ test('wait: false only opens the request', async () => {
   await srv.close();
   assert.equal(srv.calls.length, 1);
   assert.equal(outputs(env).url, 'https://hibira.io/a/apr_3');
+});
+
+test('approval-id waits for an earlier request until it expires', async () => {
+  let t = 1_700_000_000_000;
+  const srv = await serve((req) => {
+    assert.equal(req.method, 'GET');
+    assert.match(req.url, /^\/apps\/7\/approvals\/apr_9\?/);
+    t += 30_000;
+    return [200, { approval_id: 'apr_9', title: 'Deploy?', status: 'pending', url: 'u', expires_at: new Date(1_700_000_000_000 + 60_000).toISOString() }];
+  });
+  const env = envFor(srv.host, { 'APPROVAL-ID': 'apr_9', 'FAIL-ON-REJECT': 'false' });
+  await quietly(() => approval({ env, now: () => t, sleep: async () => {} }));
+  await srv.close();
+  assert.ok(srv.calls.length >= 3 && srv.calls.length <= 4, `calls: ${srv.calls.length}`);
+  assert.equal(outputs(env).status, 'pending');
 });
 
 test('approval gives up at the timeout', async () => {
@@ -222,6 +238,17 @@ test('API errors fail the step with the server message', async () => {
   assert.match(logged, /::error::Hibira API 403: this plan has no waiting rooms/);
   assert.equal(process.exitCode, 1);
   process.exitCode = 0;
+});
+
+test('a 522 from the edge is sent again; a 500 is not', async () => {
+  let srv = await serve((req, body, n) => (n < 3 ? [522, { error: 'origin unreachable' }] : [200, { ok: true }]));
+  assert.deepEqual(await send(`${srv.host}/x`, { method: 'POST', body: '{}' }, 5000, { delayMs: 1 }), { ok: true });
+  assert.equal(srv.calls.length, 3);
+  await srv.close();
+  srv = await serve(() => [500, { error: 'boom' }]);
+  await assert.rejects(send(`${srv.host}/x`, { method: 'POST', body: '{}' }, 5000, { delayMs: 1 }), /500: boom/);
+  assert.equal(srv.calls.length, 1);
+  await srv.close();
 });
 
 test('an unknown command fails', async () => {

@@ -42,11 +42,73 @@ function setApprovalOutputs(a, env) {
 }
 
 export async function approval({ env = process.env, now, sleep = defaultSleep } = {}) {
-  const title = core.input('title', env);
-  if (!title) throw new Error('title is required for approval');
   const minutes = core.int('timeout-minutes', { min: 1, max: 10080 }, env) ?? 60;
-  const options = core.list('options', env);
   const app = appFrom(env, now);
+  const existing = core.input('approval-id', env);
+  let a;
+  if (existing) {
+    a = await app.call('GET', `/approvals/${encodeURIComponent(existing)}`);
+    setApprovalOutputs(a, env);
+    core.info(`Waiting for the answer to "${a.title}"${a.url ? `: ${a.url}` : ''}`);
+  } else {
+    const request = newRequest(env, minutes);
+    a = await app.call('POST', '/approvals', { json: request });
+    setApprovalOutputs(a, env);
+    core.notice(`Waiting for an answer: ${a.url}`, request.title);
+    if (a.push_error) core.warning(`The push notification was not sent: ${a.push_error}`);
+    core.summary(`### Approval requested\n\n**${escapeMd(request.title)}**\n\n[Answer it here](${a.url})\n`, env);
+  }
+
+  if (!core.bool('wait', true, env)) return a;
+
+  const clock = now || Date.now;
+  const expires = a.expires_at ? Date.parse(a.expires_at) : NaN;
+  const deadline = (Number.isNaN(expires) ? clock() + minutes * 60_000 : expires) + 30_000;
+  const seen = new Set();
+  while (a.status === 'pending') {
+    const left = Math.floor((deadline - clock()) / 1000);
+    if (left <= 0) break;
+    const wait = Math.min(MAX_WAIT_SECONDS, left);
+    const started = clock();
+    try {
+      const prev = a;
+      a = await app.call('GET', `/approvals/${encodeURIComponent(a.approval_id)}`, {
+        query: { wait: String(wait) },
+        timeoutMs: (wait + 15) * 1000,
+      });
+      // The status answer leaves out the link; keep the one from the request.
+      if (!a.url) a.url = prev.url;
+    } catch (err) {
+      if (err.status && err.status < 500 && err.status !== 429) throw err;
+      core.warning(`Checking the approval failed, trying again: ${err.message}`);
+      await sleep(5000);
+      continue;
+    }
+    for (const m of a.discussion || []) {
+      if (m.from === 'approver' && !seen.has(m.id)) {
+        seen.add(m.id);
+        core.notice(`${m.name || 'The approver'} asked: "${m.text}" Answer on the approval page or with the Hibira MCP reply_approval tool.`, 'Question from the approver');
+      }
+    }
+    // An open question returns at once; don't spin while it waits.
+    if (a.status === 'pending' && clock() - started < 2000) await sleep(5000);
+  }
+
+  setApprovalOutputs(a, env);
+  const who = a.answered_by ? ` by ${a.answered_by.name || a.answered_by.email}` : '';
+  const line = a.status === 'pending' ? 'No answer in time.' : `${a.status}${a.choice ? ` (${a.choice})` : ''}${who}${a.comment ? `: ${a.comment}` : ''}`;
+  core.info(`Approval ${a.approval_id}: ${line}`);
+  core.summary(`**Result:** ${escapeMd(line)}\n`, env);
+  if (a.status !== 'approved' && core.bool('fail-on-reject', true, env)) {
+    throw new Error(`Not approved: ${line}`);
+  }
+  return a;
+}
+
+function newRequest(env, minutes) {
+  const title = core.input('title', env);
+  if (!title) throw new Error('title is required for approval (or approval-id, to wait for an earlier request)');
+  const options = core.list('options', env);
   const request = {
     title,
     details: core.input('details', env) || defaultDetails(env),
@@ -64,53 +126,7 @@ export async function approval({ env = process.env, now, sleep = defaultSleep } 
   if (approvers.length) request.approvers = approvers;
   const quorum = core.int('quorum', { min: 1, max: 100 }, env);
   if (quorum) request.quorum = quorum;
-
-  let a = await app.call('POST', '/approvals', { json: request });
-  setApprovalOutputs(a, env);
-  core.notice(`Waiting for an answer: ${a.url}`, title);
-  if (a.push_error) core.warning(`The push notification was not sent: ${a.push_error}`);
-  core.summary(`### Approval requested\n\n**${escapeMd(title)}**\n\n[Answer it here](${a.url})\n`, env);
-
-  if (!core.bool('wait', true, env)) return a;
-
-  const clock = now || Date.now;
-  const deadline = clock() + minutes * 60_000 + 30_000;
-  const seen = new Set();
-  while (a.status === 'pending') {
-    const left = Math.floor((deadline - clock()) / 1000);
-    if (left <= 0) break;
-    const wait = Math.min(MAX_WAIT_SECONDS, left);
-    const started = clock();
-    try {
-      a = await app.call('GET', `/approvals/${encodeURIComponent(a.approval_id)}`, {
-        query: { wait: String(wait) },
-        timeoutMs: (wait + 15) * 1000,
-      });
-    } catch (err) {
-      if (err.status && err.status < 500 && err.status !== 429) throw err;
-      core.warning(`Checking the approval failed, trying again: ${err.message}`);
-      await sleep(5000);
-      continue;
-    }
-    for (const m of a.discussion || []) {
-      if (m.from === 'approver' && !seen.has(m.id)) {
-        seen.add(m.id);
-        core.notice(`${m.name || 'The approver'} asked: ${m.text}. Answer on the approval page or with the Hibira MCP reply_approval tool.`, 'Question from the approver');
-      }
-    }
-    // An open question returns at once; don't spin while it waits.
-    if (a.status === 'pending' && clock() - started < 2000) await sleep(5000);
-  }
-
-  setApprovalOutputs(a, env);
-  const who = a.answered_by ? ` by ${a.answered_by.name || a.answered_by.email}` : '';
-  const line = a.status === 'pending' ? 'No answer in time.' : `${a.status}${a.choice ? ` (${a.choice})` : ''}${who}${a.comment ? `: ${a.comment}` : ''}`;
-  core.info(`Approval ${a.approval_id}: ${line}`);
-  core.summary(`**Result:** ${escapeMd(line)}\n`, env);
-  if (a.status !== 'approved' && core.bool('fail-on-reject', true, env)) {
-    throw new Error(`Not approved: ${line}`);
-  }
-  return a;
+  return request;
 }
 
 export async function event({ env = process.env, now } = {}) {
